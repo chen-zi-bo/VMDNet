@@ -10,26 +10,38 @@ import torch.nn.functional as F
 import torch.fft
 
 
+# 没有对每一特征都max_k学习 ，多的一个线性层先保留 mlp改为学习到（B，max_k,2） sigmoid修改   sigma初始化方法修改  alpha先去掉   温度改为0.5  fft改为rfft ，带宽惩罚项改为能量
+
+# 后面加一ver 高斯滤波器不再经过训练，就是固定的
 class MLPToLearnK(nn.Module):
+    # 特征维度   max_k
     def __init__(self, input_dim, output_dim, hidden_dim=128):
         super(MLPToLearnK, self).__init__()
         # 设定 MLP 网络层
         self.fc1 = nn.Linear(input_dim, hidden_dim)
+        # 存疑，是否有必要加着一层
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.fc3 = nn.Linear(hidden_dim, output_dim)  # 输出一个标量
+        self.fc3 = nn.Linear(hidden_dim, output_dim * 2)  # 输出一个标量
+        self.max_k = output_dim
 
     def forward(self, x):
         B, T, N = x.shape
         # 通过 MLP 学习到 k
+        # T上求均值变成(B, N) 存疑    忽略了不同特征间的差异                 之后可以改成直接找（B,max_k,N）
         x = x.mean(dim=1)
+        # 假设我们现在获得每个特征维度的代表值
         x = F.relu(self.fc1(x))
+        # 存疑          这一层可能多余
         x = F.relu(self.fc2(x))
         logits = self.fc3(x)
-        logits = torch.sigmoid(logits)
-        return logits  # 形状: [B, max_K]
+        # 求出每个批次每个max_k的logits，每个批次统一
+        logits = logits.view(B, self.max_k, 2)
+        # logits = torch.sigmoid(logits)
+        return logits  # 形状: [B, max_K,2]
 
 
 class DifferentiableVMD(nn.Module):
+    # 输入长度        特征维度
     def __init__(self, signal_length, input_dim, max_K=10):
         super().__init__()
         self.max_K = max_K
@@ -39,17 +51,24 @@ class DifferentiableVMD(nn.Module):
         # 可学习的软模态数控制参数（用来生成 gate）
         # self.k_raw = nn.Parameter(torch.tensor(3.0))  # 可学习的模态数
 
+        # 存疑 初始化是否有问题
         # 可学习的中心频率 mu（初始化均匀分布在 [0.05, 0.45]）
         self.mu = nn.Parameter(torch.linspace(0.05, 0.45, max_K))
 
-        # 可学习的带宽 sigma，初始为 0.05
-        self.sigma = nn.Parameter(torch.ones(max_K) * 0.05)
+
+        self.sigma_raw = nn.Parameter(torch.ones(max_K) * -2.0)
+
+
+        # self.sigma = nn.Parameter(torch.ones(max_K) * 0.05)
 
         # 可学习的 alpha，softplus(alpha_raw) 控制强度
         # self.alpha_raw = nn.Parameter(torch.tensor(7.6))
-        self.alpha_raw = nn.Parameter(torch.tensor(7.6))
+        # alpha问题，存疑，alpha是否还有存在的必要性
+        # self.alpha_raw = nn.Parameter(torch.tensor(7.6))
 
-        self.temperature = 1.0
+        # 温度也可能需要改变以调整尖锐程度
+        self.temperature = 0.5
+        # 温度可以随时间变化
         # # 频率轴 [-0.5, 0.5)
         # freqs = torch.fft.fftfreq(self.N)
         # self.register_buffer("freqs", freqs)
@@ -66,57 +85,61 @@ class DifferentiableVMD(nn.Module):
         B, T, N = x.shape
 
         # freqs = torch.fft.fftfreq(T, d=1. / T).to(x.device)  # [T]
-        freqs = torch.fft.fftfreq(T).to(x.device)  # 动态生成 [T]
-
+        # freqs使用存疑，和后面在高斯滤波器的使用上是否是对的
+        # fft时的k是代表着频率索引，通过fftfreq是找到真实的频率张量，这里默认采样间隔为1
+        # 尽管没有采样率，但他也是相对频率坐标
+        freqs = torch.fft.rfftfreq(T).to(x.device)  # 动态生成 [T]
         # freqs=self.freqs
         # x_fft是x在时间维（T）上的快速傅里叶变换（FFT），用于将信号从时域转换到频域。
-        x_fft = torch.fft.fft(x, dim=1)
+        x_fft = torch.fft.rfft(x, dim=1)
         # 保证惩罚系数大于0
-        alpha = F.softplus(self.alpha_raw)
+        # alpha = F.softplus(self.alpha_raw)
 
-        # k_raw = self.mlp(x)  # shape: [B, 1]
-        # k_raw = k_raw.mean(dim=1)
-        #
-        # k_raw = k_raw * self.max_K  # scale up
-        #
-        # # --- Step 2: Soft mask ---
-        # weights = torch.arange(self.max_K, device=x.device).float()  # [0, 1, ..., max_K-1]
-        # weights = weights.view(1, -1, 1, 1)  # [1, max_K, 1, 1] for broadcast
-        #
-        # soft_mask = torch.sigmoid(k_raw.view(-1, 1, 1, 1) - weights)
-        # # optional: 用个软阈值，如果小于0.1就视为0
-        # soft_mask = torch.where(soft_mask > 0.1, soft_mask, torch.zeros_like(soft_mask))
-        # # 对每个样本统计非零通道数（即 soft_mask 中 >0 的数量）
-        # k_each = (soft_mask > 0).float().sum(dim=1)  # [B] 每个样本有多少个通道有效
-        #
-        # k_cont = k_each.mean()
+        delta_mu = (self.mu[1] - self.mu[0]).detach()
+        self.sigma = delta_mu * torch.sigmoid(self.sigma_raw)
+        # 存疑
+
         imf_logits = self.mlp(x)
-        eps = 1e-10  # 用于数值稳定性，避免 log(0)
-        # 正向传播会为0-1
-        imf_selection_mask_list = []
-        for i in range(self.max_K):
-            # 抽取第 i 个 IMF 的“选择”概率
-            prob_chosen = imf_logits[:, i]  # [B]
+        # eps = 1e-10  # 用于数值稳定性，避免 log(0)
+        # # 正向传播会为0-1
+        # imf_selection_mask_list = []
+        # for i in range(self.max_K):
+        #     # ！！！！！！！！使用gumbel-softmax过程存疑
+        #     # 抽取第 i 个 IMF 的“选择”概率
+        #     prob_chosen = imf_logits[:, i]  # [B]
+        #
+        #     # 计算第 i 个 IMF 的“不选择”概率
+        #     prob_not_chosen = 1.0 - prob_chosen  # [B]
+        #
+        #     # 将概率转换回 Logits，以供 Gumbel-softmax 使用
+        #     # log(p) 是 Logit 形式，这里要分别计算选择和不选择的 Logit
+        #     logit_chosen = torch.log(prob_chosen + eps)  # 避免 log(0)
+        #     logit_not_chosen = torch.log(prob_not_chosen + eps)  # 避免 log(0)
+        #     # 将“选择”和“不选择”的 Logits 堆叠起来，形成 [B, 2] 的输入
+        #     binary_logits = torch.stack([logit_chosen, logit_not_chosen], dim=-1)  # [B, 2]
+        #
+        #     # 对每个 IMF 独立应用 Gumbel-softmax
+        #     # dim=-1 是对这两个类别 [chosen, not_chosen] 进行 softmax
+        #     # hard=True 确保前向是二元的，反向是连续的
+        #     # [:, :, 0] 抽取选中的概率（即第一个维度，代表选择）
+        #     # 传入的logits应该有问题
+        #     # 应该传入认为选的logits，然后可以将不选的logits转为0
+        #     selected_mask = F.gumbel_softmax(logits=binary_logits, tau=self.temperature, hard=True, dim=-1)[:, 0]  # [B]
+        #     # 抽取选中的概率（即第一个维度，代表选择）
+        #     imf_selection_mask_list.append(selected_mask.unsqueeze(1))
+        #
+        # imf_selection_mask = torch.cat(imf_selection_mask_list, dim=1)  # [B, max_K], 包含多个1
+        # Gumbel-Softmax
+        imf_selection = F.gumbel_softmax(
+            imf_logits,
+            tau=self.temperature,
+            hard=True,
+            dim=-1
+        )  # [B, max_K, 2]
 
-            # 计算第 i 个 IMF 的“不选择”概率
-            prob_not_chosen = 1.0 - prob_chosen  # [B]
+        # 取“选择”那一维
+        imf_selection_mask = imf_selection[..., 0]  # [B, max_K]
 
-            # 将概率转换回 Logits，以供 Gumbel-softmax 使用
-            # log(p) 是 Logit 形式，这里要分别计算选择和不选择的 Logit
-            logit_chosen = torch.log(prob_chosen + eps)  # 避免 log(0)
-            logit_not_chosen = torch.log(prob_not_chosen + eps)  # 避免 log(0)
-            # 将“选择”和“不选择”的 Logits 堆叠起来，形成 [B, 2] 的输入
-            binary_logits = torch.stack([logit_chosen, logit_not_chosen], dim=-1)  # [B, 2]
-
-            # 对每个 IMF 独立应用 Gumbel-softmax
-            # dim=-1 是对这两个类别 [chosen, not_chosen] 进行 softmax
-            # hard=True 确保前向是二元的，反向是连续的
-            # [:, :, 0] 抽取选中的概率（即第一个维度，代表选择）
-            selected_mask = F.gumbel_softmax(logits=binary_logits, tau=self.temperature, hard=True, dim=-1) [:, 0]  # [B]
-            # 抽取选中的概率（即第一个维度，代表选择）
-            imf_selection_mask_list.append(selected_mask.unsqueeze(1))
-
-        imf_selection_mask = torch.cat(imf_selection_mask_list, dim=1)  # [B, max_K], 包含多个1
 
         k_cont = imf_selection_mask.sum(dim=1)  # [B]  每个批次每条数据的k值
 
@@ -124,11 +147,10 @@ class DifferentiableVMD(nn.Module):
         imfs_fft = []
         imfs_energy = []
         bandwidth_penalty = 0.0
+        imfs_energy_batchwise = []  # 用于收集每个IMF在每个批次中的能量
         eps = 1e-8
 
         for i in range(self.max_K):
-            # 如果小于阈值 不用计算该IMF
-            mu_i = self.mu[i]
             # 获取中心频率
             mu_i = self.mu[i]
 
@@ -136,6 +158,7 @@ class DifferentiableVMD(nn.Module):
             sigma_i = self.sigma[i].abs() + 1e-4
 
             # 使用高斯滤波器
+            # 这里freqs的使用有问题，应该先取绝对值，正频率和负频率是共轭的，都应该滤波
             filter_i = torch.exp(-0.5 * ((freqs - mu_i) / sigma_i) ** 2).to(x.device)  # [T]
 
             # broadcast filter: [T, 1] -> [1, T, 1] -> [B, T, N]
@@ -145,7 +168,9 @@ class DifferentiableVMD(nn.Module):
             filtered_fft = x_fft * filter_i  # [B, T, N]
 
             # 获得对应的imf
-            imf_i = torch.fft.ifft(filtered_fft, dim=1).real  # 在时间维上做逆 FFT
+            imf_i = torch.fft.irfft(filtered_fft, dim=1).real.float()  # 在时间维上做逆 FFT
+
+            imfs_energy_batchwise.append(imf_i.pow(2).sum(dim=[1, 2]))
 
             # soft mask 作用（选择性使用模态）
             # print(soft_mask.shape)
@@ -154,15 +179,23 @@ class DifferentiableVMD(nn.Module):
             # print(mask_i.shape)
             imf_i = imf_i * current_imf_weight  # 广播乘法 → [B, T, N]
             # [B, 1, T, N]
+            # 没选为0的也会append
             imfs_fft.append(imf_i.unsqueeze(1))
             imfs_energy.append((imf_i ** 2).sum())
 
             # 计算带宽惩罚项
-            u_hat = filtered_fft.abs()  # [B, T, N]
-            num = ((freqs - mu_i) ** 2).view(1, T, 1) * u_hat
+            # 建议修改计算带宽惩罚
 
-            penalty_i = num.sum(dim=1) / (u_hat.sum(dim=1) + eps)  # [B, N]
+            # freqs使用也存在问题，这里我们评判带宽惩罚用的是幅值，还可以用能量，
+            # u_hat = filtered_fft.abs().pow(2)  # [B, T, N]
+            # num = ((freqs - mu_i) ** 2).view(1, T, 1) * u_hat
+            # penalty_i = num.sum(dim=1) / (u_hat.sum(dim=1) + eps)  # [B, N]
+            power = filtered_fft.abs().pow(2)  # |U|^2
+            num = ((freqs - mu_i) ** 2).view(1, freqs.shape[0], 1) * power
+            penalty_i = num.sum(dim=1) / (power.sum(dim=1) + eps)
             bandwidth_penalty += (penalty_i * current_imf_weight.squeeze(1)).mean()
+
+        # 计算每个IMF在每个批次中的能量占比 [B, max_K]
         # 检查是否所有模式都被排除了
         if not imfs_fft or imf_selection_mask.sum() == 0:
             # 如果所有的 IMF 都被 Gumbel-softmax 选为 0，这可能会导致问题
@@ -174,10 +207,11 @@ class DifferentiableVMD(nn.Module):
             # 但更合理的做法是让损失函数引导模型至少选择一个IMF
             # 例如，在损失函数中加入一个惩罚项，如果k_cont过低
             print("Warning: All IMFs were selected as zero by Gumbel-softmax.")
-            imfs = torch.zeros(B, 1, T, N, device=x.device) # 至少返回一个维度
+            imfs = torch.zeros(B, 1, T, N, device=x.device)  # 至少返回一个维度
             x_recon = torch.zeros_like(x)
         else:
-            imfs = torch.cat(imfs_fft, dim=1) # [B, k_active, T, N]
+            # 包含不选的imf
+            imfs = torch.cat(imfs_fft, dim=1)  # [B, k_active, T, N]
             x_recon = imfs.sum(dim=1)  # [B, T, N]
 
         # 重构loss
@@ -203,21 +237,13 @@ class DifferentiableVMD(nn.Module):
                 valid_indices = (norm_i > eps) & (norm_j > eps)
                 if valid_indices.sum() > 0:
                     orth_term = (dot_product[valid_indices] / (
-                                norm_i[valid_indices] * norm_j[valid_indices] + eps)) ** 2
+                            norm_i[valid_indices] * norm_j[valid_indices] + eps)) ** 2
                     orth_loss += orth_term.mean()  # 对有效项求平均
-
-        # 能量惩罚
-        # ---------- Energy penalty ----------
         energy_penalty = 0.0
-        total_energy = x.pow(2).sum()
-        for i, e in enumerate(imfs_energy):
-            ratio = e / (total_energy + eps)
-            energy_penalty += torch.exp(-ratio)
-            # 添加带宽loss
 
-        total_loss = recon_loss + alpha * bandwidth_penalty + 0.25 * orth_loss
+        total_loss = recon_loss + bandwidth_penalty + 0.25 * orth_loss
 
-        return imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, alpha, k_cont
+        return imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, k_cont
 
 
 class VMD_Change(nn.Module):
@@ -236,35 +262,20 @@ class VMD_Change(nn.Module):
         # 传入输入窗口长度，预测长度，以及特征数
         self.vmd = DifferentiableVMD(signal_length=self.seq_len, input_dim=self.enc_in)
 
-        self.model_freq = MLPMain(seq_len=self.seq_len, pred_len=self.pred_len, enc_in=self.enc_in)
+        self.model_freq = MLPfreq(seq_len=self.seq_len, pred_len=self.pred_len, enc_in=self.enc_in)
         # self.model_freq=
 
     def vmd_loss(self, x):
-        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, alpha, k = self.vmd(x)
+        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, k = self.vmd(x)
         return total_loss
 
     def loss(self, true):
         # freq normalization
         B, O, N = true.shape
         # 把true分开
-        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, alpha, k = self.vmd(true)
+        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, k = self.vmd(true)
 
-        # === Step 2: 计算能量占比并筛选 IMF ===
-        total_energy = true.pow(2).sum()
-        imfs_energy = (imfs ** 2).sum(dim=[2, 3])  # [B, k_used] 每个模态在一个 batch 的能量
-        energy_ratio = imfs_energy / (total_energy + 1e-8)
-
-        # 平均每个 IMF 的能量占比（跨 batch 求平均）
-        mean_energy_ratio = energy_ratio.mean(dim=0)  # [k_used]
-
-        # 找出能量占比 > 5% 的模态索引
-        keep_indices = torch.nonzero(mean_energy_ratio > 0.05).squeeze(-1)
-        if keep_indices.numel() == 0:
-            keep_indices = torch.tensor([mean_energy_ratio.argmax()], device=true.device)
-
-        # === Step 3: 只保留高能量 IMF，作为主要频率成分 ===
-        main_imfs = imfs[:, keep_indices]  # [B, k_filtered, T, N]
-        pred_main = main_imfs.sum(dim=1)  # [B, T, N]
+        pred_main = imfs.sum(dim=1)  # [B, T, N]
 
         residual = true - pred_main
 
@@ -278,24 +289,9 @@ class VMD_Change(nn.Module):
         # 获取输入数据的批次数量、序列长度以及维度
         bs, len, dim = input.shape
 
-        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, alpha, k = self.vmd(input)
+        imfs, x_recon, total_loss, recon_loss, bandwidth_penalty, orth_loss, energy_penalty, k = self.vmd(input)
 
-        # === Step 2: 计算能量占比并筛选 IMF ===
-        total_energy = input.pow(2).sum()
-        imfs_energy = (imfs ** 2).sum(dim=[2, 3])  # [B, k_used] 每个模态在一个 batch 的能量
-        energy_ratio = imfs_energy / (total_energy + 1e-8)
-
-        # 平均每个 IMF 的能量占比（跨 batch 求平均）
-        mean_energy_ratio = energy_ratio.mean(dim=0)  # [k_used]
-
-        # 找出能量占比 > 5% 的模态索引
-        keep_indices = torch.nonzero(mean_energy_ratio > 0.05).squeeze(-1)
-        if keep_indices.numel() == 0:
-            keep_indices = torch.tensor([mean_energy_ratio.argmax()], device=input.device)
-
-        # === Step 3: 只保留高能量 IMF，作为主要频率成分 ===
-        main_imfs = imfs[:, keep_indices]  # [B, k_filtered, T, N]
-        main_sum = main_imfs.sum(dim=1)  # [B, T, N]
+        main_sum = imfs.sum(dim=1)  # [B, T, N]
         # if self.visual:
         #     plot_and_save_vmd_results(input, imfs, main_imfs, main_sum)
 
@@ -324,65 +320,16 @@ class VMD_Change(nn.Module):
             return self.denormalize(batch_x)
 
 
-# def plot_and_save_vmd_results(input, imfs, main_imfs, main_sum, save_dir="vmd_plots", batch_idx=0, var_idx=0):
-#     import matplotlib.pyplot as plt
-#     import os
-#     os.makedirs(save_dir, exist_ok=True)  # 创建保存目录
-#
-#     # === Step 1: 原始输入 ===
-#     plt.figure(figsize=(14, 4))
-#     plt.plot(input[batch_idx, :, var_idx].detach().cpu().numpy(), label='Original Input')
-#     plt.title('Original Input')
-#     plt.legend()
-#     plt.tight_layout()
-#     plt.savefig(os.path.join(save_dir, 'original_input.png'))
-#     plt.close()
-#
-#     # === Step 2: 所有 IMF ===
-#     B, k, T, N = imfs.shape
-#     plt.figure(figsize=(14, 2 * k))
-#     for i in range(k):
-#         plt.subplot(k, 1, i + 1)
-#         plt.plot(imfs[batch_idx, i, :, var_idx].detach().cpu().numpy())
-#         plt.title(f'IMF {i}')
-#     plt.tight_layout()
-#     plt.savefig(os.path.join(save_dir, 'all_imfs.png'))
-#     plt.close()
-#
-#     # === Step 3: main_imfs（能量占比高的 IMF）===
-#     k_filtered = main_imfs.shape[1]
-#     plt.figure(figsize=(14, 2 * k_filtered))
-#     for i in range(k_filtered):
-#         plt.subplot(k_filtered, 1, i + 1)
-#         plt.plot(main_imfs[batch_idx, i, :, var_idx].detach().cpu().numpy())
-#         plt.title(f'Main IMF {i}')
-#     plt.tight_layout()
-#     plt.savefig(os.path.join(save_dir, 'main_imfs.png'))
-#     plt.close()
-#
-#     # === Step 4: 主频分量的重构 vs 原始输入 ===
-#     plt.figure(figsize=(14, 4))
-#     plt.plot(input[batch_idx, :, var_idx].detach().cpu().numpy(), label='Original Input')
-#     plt.plot(main_sum[batch_idx, :, var_idx].detach().cpu().numpy(), label='Main IMF Sum (Reconstruction)')
-#     plt.title('Original vs Main IMF Sum')
-#     plt.legend()
-#     plt.tight_layout()
-#     plt.savefig(os.path.join(save_dir, 'reconstruction_vs_original.png'))
-#     plt.close()
-#
-#     print(f"✅ 图像已保存到目录: {save_dir}")
-
-
-class MLPMain(nn.Module):
+class MLPfreq(nn.Module):
     # 例如传入96 96 321
     def __init__(self, seq_len, pred_len, enc_in):
-        super(MLPMain, self).__init__()
+        super(MLPfreq, self).__init__()
         # 变量的赋值
         self.seq_len = seq_len
         self.pred_len = pred_len
         self.channels = enc_in
         # model_freq该模块包括一个全连接层以及一个激活函数
-        self.model_main = nn.Sequential(
+        self.model_freq = nn.Sequential(
             nn.Linear(self.seq_len, 64),
             nn.ReLU(),
         )
@@ -403,22 +350,22 @@ class MLPMain(nn.Module):
     def forward(self, main_freq, x):
         # （batch_size, channels, 64)
         # return self.linear(main_freq)
-        self.model_main(main_freq)
+        self.model_freq(main_freq)
         # # self.model_freq的输出形状是[batch_size, 64]，x原本数据
         # # 最终输出的张量inp的形状是[batch_size, 64 + seq_len]
-        inp = torch.concat([self.model_main(main_freq), x], dim=-1)
+        inp = torch.concat([self.model_freq(main_freq), x], dim=-1)
         # # 最后使用model_all进行预测
         # # 然后进过该模块获得# （batch_size, channels, pred_len)
         return self.model_all(inp)
 
 
-class VMDNet(nn.Module):
+class VMD_DLinear(nn.Module):
     """
     Decomposition-Linear
     """
 
     def __init__(self, seq_len, pred_len, enc_in, individual: bool = False):
-        super(VMDNet, self).__init__()
+        super(VMD_DLinear, self).__init__()
         self.seq_len = seq_len
         self.pred_len = pred_len
 
@@ -475,5 +422,11 @@ class VMDNet(nn.Module):
             trend_output = self.Linear_Trend(trend_init)
 
         x = seasonal_output + trend_output
+
         pred = self.vmd.denormalize(x.permute(0, 2, 1))
         return pred  # to [Batch, Output length, Channel]
+
+
+
+
+
