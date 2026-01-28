@@ -4,7 +4,7 @@
 
 This is the offcial repository of paper "Learnable Variational Mode Decomposition for Non-stationary Time Series Forecasting"
 
-![FAN](./stru.png)
+![FAN](./final_stru.png)
 
 
 
